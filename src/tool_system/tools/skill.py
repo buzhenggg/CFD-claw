@@ -88,23 +88,50 @@ class SkillTool:
             argument_names=skill.arg_names,
         )
         if skill.skill_root:
+            from ...command_system.types import _project_root_for_skill
+
             content = f"Base directory for this skill: {skill.skill_root}\n\n{content}"
             skill_dir = skill.skill_root.replace("\\", "/")
+            project_dir = _project_root_for_skill(skill.skill_root, context).replace("\\", "/")
             content = content.replace("${CLAUDE_SKILL_DIR}", skill_dir)
+            content = content.replace("$CLAUDE_SKILL_DIR", skill_dir)
+            content = content.replace("${CLAUDE_PROJECT_DIR}", project_dir)
+            content = content.replace("$CLAUDE_PROJECT_DIR", project_dir)
 
-        return ToolResult(
-            name="Skill",
-            output={
-                "success": True,
-                "commandName": normalized,
-                "status": "inline",
-                "allowedTools": list(skill.allowed_tools) if skill.allowed_tools else [],
-                "model": skill.model,
-                "loadedFrom": skill.loaded_from,
-                "skillRoot": skill.skill_root,
-                "prompt": content,
-            },
-        )
+        command_output = None
+        if skill.run_command:
+            from ...command_system.types import _run_prompt_command
+
+            command_output = _run_prompt_command(
+                template=skill.run_command,
+                args=args,
+                arg_names=list(skill.arg_names),
+                skill_root=skill.skill_root,
+                context=context,
+            )
+            content = (
+                "The local retriever command for this skill has already been executed. "
+                "Do not call Bash again; answer from the command output below.\n\n"
+                f"{content}\n\n"
+                "Retrieved command output:\n\n"
+                f"```text\n{command_output}\n```"
+            )
+
+        output = {
+            "success": True,
+            "commandName": normalized,
+            "status": "inline",
+            "allowedTools": list(skill.allowed_tools) if skill.allowed_tools else [],
+            "model": skill.model,
+            "loadedFrom": skill.loaded_from,
+            "skillRoot": skill.skill_root,
+            "runCommand": skill.run_command,
+            "prompt": content,
+        }
+        if command_output is not None:
+            output["retrievedCommandOutput"] = command_output
+
+        return ToolResult(name="Skill", output=output)
 
     def _run_legacy_python_skill(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
         name = tool_input.get("name")

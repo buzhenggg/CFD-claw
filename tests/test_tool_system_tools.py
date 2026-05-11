@@ -329,6 +329,29 @@ class TestSkillTool(ToolSystemTests):
             self.assertIn("Hello bob!", out["prompt"])
             self.assertEqual(out["loadedFrom"], "user")
 
+    def test_skill_run_command_includes_retrieved_output(self) -> None:
+        skill_dir = self.root / ".clawd" / "skills" / "rag-demo"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "description: demo rag skill\n"
+            "arguments: [query]\n"
+            "run-command: printf 'hit=%s\\nproject=%s' $ARGUMENTS ${CLAUDE_PROJECT_DIR}\n"
+            "---\n"
+            "Use ${CLAUDE_PROJECT_DIR}/RAG-data for $query.",
+            encoding="utf-8",
+        )
+
+        out = SkillTool().run({"skill": "rag-demo", "args": "RD-170 engine"}, self.ctx).output
+
+        self.assertTrue(out["success"])
+        self.assertEqual(out["runCommand"], "printf 'hit=%s\\nproject=%s' $ARGUMENTS ${CLAUDE_PROJECT_DIR}")
+        self.assertIn("Do not call Bash again", out["prompt"])
+        self.assertIn("Retrieved command output", out["prompt"])
+        self.assertIn("hit=RD-170 engine", out["retrievedCommandOutput"])
+        self.assertIn(f"project={self.root}", out["retrievedCommandOutput"])
+        self.assertIn(f"Use {self.root}/RAG-data", out["prompt"])
+
     def test_skill_runs_legacy_python_skill(self) -> None:
         skills_dir = self.root / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)

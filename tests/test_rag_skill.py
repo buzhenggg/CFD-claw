@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
@@ -82,6 +83,115 @@ def test_search_rag_reports_when_no_hits_exist(tmp_path: Path) -> None:
     )
 
     assert "No relevant chunks found." in completed.stdout
+
+
+def test_search_rag_can_emit_structured_json(tmp_path: Path) -> None:
+    data_dir = tmp_path / "RAG-data"
+    data_dir.mkdir()
+    (data_dir / "engines.md").write_text(
+        "# RD-170\nRD-170 是大型液体火箭发动机。\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--data-dir",
+            str(data_dir),
+            "--query",
+            "RD-170 发动机",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert payload["query"] == "RD-170 发动机"
+    assert payload["markdown_files_scanned"] == 1
+    assert payload["chunks_indexed"] >= 1
+    assert "candidate_chunks" in payload
+    assert "timings" in payload
+    assert payload["hits"][0]["file"] == "RAG-data/engines.md"
+    assert payload["hits"][0]["start_line"] == 1
+    assert "RD-170" in payload["hits"][0]["snippet"]
+
+
+def test_search_rag_uses_index_cache_when_enabled(tmp_path: Path) -> None:
+    data_dir = tmp_path / "RAG-data"
+    cache_dir = tmp_path / "cache"
+    data_dir.mkdir()
+    (data_dir / "engines.md").write_text(
+        "# YF-21\nYF-21 液体火箭发动机用于推进系统。\n",
+        encoding="utf-8",
+    )
+
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--data-dir",
+        str(data_dir),
+        "--query",
+        "YF-21",
+        "--format",
+        "json",
+        "--use-cache",
+        "--cache-dir",
+        str(cache_dir),
+    ]
+    first = subprocess.run(command, check=True, capture_output=True, text=True)
+    second = subprocess.run(command, check=True, capture_output=True, text=True)
+
+    first_payload = json.loads(first.stdout)
+    second_payload = json.loads(second.stdout)
+    assert first_payload["cache"]["enabled"] is True
+    assert first_payload["cache"]["hit"] is False
+    assert first_payload["cache"]["type"] == "sqlite"
+    assert second_payload["cache"]["hit"] is True
+    assert list(cache_dir.glob("rag_index_*.sqlite"))
+    assert second_payload["candidate_chunks"] >= 1
+    assert second_payload["timings"]["total_ms"] >= 0
+
+
+def test_search_rag_normalizes_compact_designations(tmp_path: Path) -> None:
+    data_dir = tmp_path / "RAG-data"
+    data_dir.mkdir()
+    (data_dir / "engines.md").write_text(
+        "# RD-170\nRD-170 uses a staged-combustion cycle.\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--data-dir",
+            str(data_dir),
+            "--query",
+            "RD170",
+            "--top-k",
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "engines.md" in completed.stdout
+    assert "RD-170" in completed.stdout
+
+
+def test_search_rag_expands_broad_engine_design_queries() -> None:
+    expanded = search_rag.expand_query_for_retrieval("如何设计一个好的发动机")
+    exact = search_rag.expand_query_for_retrieval("RD-170 发动机怎么设计")
+
+    assert "可靠性" in expanded
+    assert "维修性" in expanded
+    assert "传热" in expanded
+    assert exact == "RD-170 发动机怎么设计"
 
 
 def test_search_rag_falls_back_from_skill_relative_data_dir(tmp_path: Path) -> None:

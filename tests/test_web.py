@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from src.config import _encode_api_key
 from src.providers.base import BaseProvider, ChatResponse
+from src.tool_system.agent_loop import ToolEvent
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.registry import ToolRegistry
 from src.web import ClawdWebService
@@ -115,6 +116,40 @@ class TestClawdWebService(unittest.TestCase):
             self.assertEqual(reply["session"]["messages"][0]["role"], "user")
             self.assertEqual(reply["session"]["messages"][1]["role"], "assistant")
 
+    @patch("src.agent.session.Path.home")
+    @patch("src.web.app.build_default_registry", side_effect=lambda **_kwargs: ToolRegistry())
+    @patch("src.web.app.get_provider_class", return_value=FakeProvider)
+    def test_auto_skill_is_exposed_and_injected(
+        self,
+        _mock_provider_class,
+        _mock_build_registry,
+        mock_session_home,
+    ) -> None:
+        mock_session_home.return_value = self.home
+        workspace = self.home / "workspace"
+        skill_dir = workspace / ".clawd" / "skills" / "aircraft-design-rag"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: aircraft-design-rag\ndescription: RAG test skill\n---\nUse local RAG.",
+            encoding="utf-8",
+        )
+
+        with patch("src.config.Path.home", return_value=self.home):
+            service = ClawdWebService(workspace_root=workspace)
+            payload = service.get_bootstrap_payload()
+            created = service.create_session(
+                provider_name="openai",
+                model="qwen3-4b",
+                auto_skill="aircraft-design-rag",
+            )
+            reply = service.send_message(created["session"]["session_id"], "What is RD-170?")
+
+        self.assertEqual(payload["default_auto_skill"], "aircraft-design-rag")
+        self.assertEqual(payload["skills"][0]["name"], "aircraft-design-rag")
+        self.assertEqual(created["session"]["auto_skill"], "aircraft-design-rag")
+        self.assertIn("Skill tool", reply["reply"]["text"])
+        self.assertIn("aircraft-design-rag", reply["reply"]["text"])
+
     def test_bootstrap_payload_marks_configured_providers(self) -> None:
         with patch("src.config.Path.home", return_value=self.home):
             service = ClawdWebService(workspace_root=self.home / "workspace")
@@ -124,4 +159,277 @@ class TestClawdWebService(unittest.TestCase):
         self.assertEqual(payload["default_provider"], "openai")
         self.assertTrue(providers["openai"]["configured"])
         self.assertFalse(providers["anthropic"]["configured"])
+        self.assertIn("skills", payload)
+        self.assertIn("rag", payload)
 
+    @patch("src.agent.session.Path.home")
+    @patch("src.web.app.build_default_registry", side_effect=lambda **_kwargs: ToolRegistry())
+    @patch("src.web.app.get_provider_class", return_value=FakeProvider)
+    def test_rag_settings_are_serialized_and_sessions_are_listed(
+        self,
+        _mock_provider_class,
+        _mock_build_registry,
+        mock_session_home,
+    ) -> None:
+        mock_session_home.return_value = self.home
+        with patch("src.config.Path.home", return_value=self.home):
+            service = ClawdWebService(workspace_root=self.home / "workspace")
+            created = service.create_session(
+                provider_name="openai",
+                model="qwen3-4b",
+                rag_settings={
+                    "top_k": 3,
+                    "max_snippet_chars": 160,
+                    "candidate_limit": 600,
+                    "use_cache": False,
+                    "auto_retrieve": False,
+                },
+            )
+            listed = service.list_sessions_payload()
+
+        self.assertEqual(created["session"]["rag_settings"]["top_k"], 3)
+        self.assertEqual(created["session"]["rag_settings"]["max_snippet_chars"], 160)
+        self.assertEqual(created["session"]["rag_settings"]["candidate_limit"], 600)
+        self.assertFalse(created["session"]["rag_settings"]["use_cache"])
+        self.assertFalse(created["session"]["rag_settings"]["auto_retrieve"])
+        self.assertEqual(len(listed["sessions"]), 1)
+        self.assertEqual(listed["sessions"][0]["session_id"], created["session"]["session_id"])
+
+    def test_rag_settings_validation_rejects_out_of_range_values(self) -> None:
+        service = ClawdWebService(workspace_root=self.home / "workspace")
+        with self.assertRaises(ValueError):
+            service._normalize_rag_settings({"top_k": 0})
+        with self.assertRaises(ValueError):
+            service._normalize_rag_settings({"max_snippet_chars": 40})
+        with self.assertRaises(ValueError):
+            service._normalize_rag_settings({"use_cache": "yes"})
+        with self.assertRaises(ValueError):
+            service._normalize_rag_settings({"candidate_limit": 20})
+
+    @patch("src.agent.session.Path.home")
+    @patch("src.web.app.build_default_registry", side_effect=lambda **_kwargs: ToolRegistry())
+    @patch("src.web.app.get_provider_class", return_value=FakeProvider)
+    def test_streaming_send_message_emits_text_chunks(
+        self,
+        _mock_provider_class,
+        _mock_build_registry,
+        mock_session_home,
+    ) -> None:
+        mock_session_home.return_value = self.home
+        chunks: list[str] = []
+        with patch("src.config.Path.home", return_value=self.home):
+            service = ClawdWebService(workspace_root=self.home / "workspace")
+            created = service.create_session(provider_name="openai", model="qwen3-4b")
+            reply = service.send_message(
+                created["session"]["session_id"],
+                "Hello streamed browser",
+                stream=True,
+                on_text_chunk=chunks.append,
+            )
+
+        self.assertEqual(reply["reply"]["text"], "Echo: Hello streamed browser")
+        self.assertEqual("".join(chunks), "Echo: Hello streamed browser")
+
+    @patch("src.web.app.RagIndexService.search")
+    def test_search_rag_uses_in_process_rag_service_with_settings(self, mock_search) -> None:
+        workspace = self.home / "workspace"
+        skill_dir = workspace / ".clawd" / "skills" / "aircraft-design-rag"
+        script_dir = skill_dir / "scripts"
+        script_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: aircraft-design-rag\ndescription: RAG test skill\n---\nUse local RAG.",
+            encoding="utf-8",
+        )
+        (script_dir / "search_rag.py").write_text("print('{}')", encoding="utf-8")
+        (workspace / "RAG-data").mkdir(parents=True)
+        rag_payload = {
+            "query": "RD-170",
+            "markdown_files_scanned": 1,
+            "chunks_indexed": 1,
+            "cache": {"enabled": False, "hit": False, "path": None},
+            "hits": [],
+        }
+        mock_search.return_value = rag_payload
+
+        service = ClawdWebService(workspace_root=workspace)
+        result = service.search_rag(
+            "RD-170",
+            rag_settings={
+                "top_k": 2,
+                "max_snippet_chars": 120,
+                "candidate_limit": 500,
+                "use_cache": False,
+                "auto_retrieve": True,
+            },
+        )
+
+        called_query, called_settings = mock_search.call_args.args
+        self.assertEqual(result["rag"]["query"], "RD-170")
+        self.assertEqual(called_query, "RD-170")
+        self.assertEqual(called_settings.top_k, 2)
+        self.assertEqual(called_settings.max_snippet_chars, 120)
+        self.assertEqual(called_settings.candidate_limit, 500)
+        self.assertFalse(called_settings.use_cache)
+
+    @patch("src.web.app.RagIndexService.rebuild")
+    @patch("src.web.app.RagIndexService.status")
+    def test_rag_status_and_rebuild_use_in_process_service(self, mock_status, mock_rebuild) -> None:
+        workspace = self.home / "workspace"
+        skill_dir = workspace / ".clawd" / "skills" / "aircraft-design-rag"
+        script_dir = skill_dir / "scripts"
+        script_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: aircraft-design-rag\ndescription: RAG test skill\n---\nUse local RAG.",
+            encoding="utf-8",
+        )
+        (script_dir / "search_rag.py").write_text("print('{}')", encoding="utf-8")
+        (workspace / "RAG-data").mkdir(parents=True)
+        mock_status.return_value = {"cache_ready": True, "cache": {"chunk_count": 1}}
+        mock_rebuild.return_value = {"rebuild": {"running": True}}
+
+        service = ClawdWebService(workspace_root=workspace)
+        status = service.rag_status()
+        rebuild = service.rebuild_rag(
+            rag_settings={"candidate_limit": 500},
+            force=False,
+        )
+
+        self.assertTrue(status["rag"]["cache_ready"])
+        self.assertTrue(rebuild["rag"]["rebuild"]["running"])
+        called_settings = mock_rebuild.call_args.args[0]
+        self.assertEqual(called_settings.candidate_limit, 500)
+        self.assertFalse(mock_rebuild.call_args.kwargs["force"])
+
+    @patch("src.agent.session.Path.home")
+    @patch("src.web.app.RagIndexService.search")
+    @patch("src.web.app.RagIndexService.cache_ready", return_value=True)
+    @patch("src.web.app.build_default_registry", side_effect=lambda **_kwargs: ToolRegistry())
+    @patch("src.web.app.get_provider_class", return_value=FakeProvider)
+    def test_auto_rag_preflight_attaches_evidence_event(
+        self,
+        _mock_provider_class,
+        _mock_build_registry,
+        _mock_cache_ready,
+        mock_search,
+        mock_session_home,
+    ) -> None:
+        mock_session_home.return_value = self.home
+        workspace = self.home / "workspace"
+        skill_dir = workspace / ".clawd" / "skills" / "aircraft-design-rag"
+        script_dir = skill_dir / "scripts"
+        script_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: aircraft-design-rag\ndescription: RAG test skill\n---\nUse local RAG.",
+            encoding="utf-8",
+        )
+        (script_dir / "search_rag.py").write_text("print('{}')", encoding="utf-8")
+        (workspace / "RAG-data").mkdir(parents=True)
+        rag_payload = {
+            "query": "RD-170",
+            "markdown_files_scanned": 1,
+            "chunks_indexed": 1,
+            "cache": {"enabled": True, "hit": True, "path": "cache.json"},
+            "hits": [
+                {
+                    "rank": 1,
+                    "score": 7.5,
+                    "file": "RAG-data/engine.md",
+                    "start_line": 2,
+                    "end_line": 8,
+                    "heading": "RD-170",
+                    "snippet": "RD-170 is a staged-combustion engine.",
+                }
+            ],
+        }
+        mock_search.return_value = rag_payload
+
+        with patch("src.config.Path.home", return_value=self.home):
+            service = ClawdWebService(workspace_root=workspace)
+            created = service.create_session(
+                provider_name="openai",
+                model="qwen3-4b",
+                auto_skill="aircraft-design-rag",
+            )
+            reply = service.send_message(created["session"]["session_id"], "What is RD-170?")
+
+        events = reply["reply"]["events"]
+        self.assertEqual(events[0]["kind"], "rag_retrieval")
+        self.assertEqual(events[0]["rag"]["hits"][0]["file"], "RAG-data/engine.md")
+        self.assertIn("Browser-attached RAG evidence", reply["reply"]["text"])
+
+    @patch("src.agent.session.Path.home")
+    @patch("src.web.app.RagIndexService.search")
+    @patch("src.web.app.RagIndexService.not_ready_payload")
+    @patch("src.web.app.RagIndexService.rebuild")
+    @patch("src.web.app.RagIndexService.cache_ready", return_value=False)
+    @patch("src.web.app.build_default_registry", side_effect=lambda **_kwargs: ToolRegistry())
+    @patch("src.web.app.get_provider_class", return_value=FakeProvider)
+    def test_auto_rag_preflight_starts_background_rebuild_when_cache_is_cold(
+        self,
+        _mock_provider_class,
+        _mock_build_registry,
+        _mock_cache_ready,
+        mock_rebuild,
+        mock_not_ready_payload,
+        mock_search,
+        mock_session_home,
+    ) -> None:
+        mock_session_home.return_value = self.home
+        workspace = self.home / "workspace"
+        skill_dir = workspace / ".clawd" / "skills" / "aircraft-design-rag"
+        script_dir = skill_dir / "scripts"
+        script_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: aircraft-design-rag\ndescription: RAG test skill\n---\nUse local RAG.",
+            encoding="utf-8",
+        )
+        (script_dir / "search_rag.py").write_text("print('{}')", encoding="utf-8")
+        (workspace / "RAG-data").mkdir(parents=True)
+        mock_not_ready_payload.return_value = {
+            "query": "What is RD-170?",
+            "markdown_files_scanned": 1,
+            "chunks_indexed": 0,
+            "candidate_chunks": 0,
+            "cache": {"enabled": True, "ready": False, "build_in_progress": True},
+            "message": "RAG index is building in the background.",
+            "hits": [],
+        }
+
+        with patch("src.config.Path.home", return_value=self.home):
+            service = ClawdWebService(workspace_root=workspace)
+            created = service.create_session(
+                provider_name="openai",
+                model="qwen3-4b",
+                auto_skill="aircraft-design-rag",
+            )
+            reply = service.send_message(created["session"]["session_id"], "What is RD-170?")
+
+        events = reply["reply"]["events"]
+        self.assertEqual(events[0]["kind"], "rag_retrieval")
+        self.assertTrue(events[0]["rag"]["cache"]["build_in_progress"])
+        mock_rebuild.assert_called_once()
+        mock_search.assert_not_called()
+
+    def test_skill_tool_event_extracts_rag_payload(self) -> None:
+        service = ClawdWebService(workspace_root=self.home / "workspace")
+        rag_payload = {
+            "query": "RD-170",
+            "markdown_files_scanned": 1,
+            "chunks_indexed": 1,
+            "cache": {"enabled": True, "hit": False, "path": None},
+            "hits": [{"rank": 1, "score": 1, "file": "a.md", "start_line": 1, "end_line": 2, "snippet": "hit"}],
+        }
+        event = ToolEvent(
+            kind="tool_result",
+            tool_name="Skill",
+            tool_output={
+                "success": True,
+                "retrievedCommandOutput": "Command: search\n\nExit code: 0\n\nSTDOUT:\n"
+                + json.dumps(rag_payload),
+            },
+        )
+
+        serialized = service._serialize_tool_event(event)
+
+        self.assertEqual(serialized["rag"]["query"], "RD-170")
+        self.assertEqual(serialized["rag"]["hits"][0]["file"], "a.md")
